@@ -6,7 +6,6 @@ import os
 app = Flask(__name__)
 
 # IKEA URL Templates
-# FR uses /fr/fr/ because /fr/en/ does not exist; others use /en/
 URL_TEMPLATES = {
     'BE': 'https://www.ikea.com/be/en/p/{id}/',
     'NL': 'https://www.ikea.com/nl/en/p/{id}/',
@@ -15,9 +14,6 @@ URL_TEMPLATES = {
 }
 
 def get_price_via_browser(country_data):
-    """
-    Fetches product details with heavy optimization for cloud environments.
-    """
     country_code, item_id = country_data
     clean_id = item_id.replace('.', '').replace(' ', '')
     url = URL_TEMPLATES[country_code].format(id=clean_id)
@@ -25,79 +21,75 @@ def get_price_via_browser(country_data):
     p = sync_playwright().start()
     browser = None
     try:
-        # Launch options optimized for Render/Heroku (Low RAM)
+        # Optimized for Cloud (Render) RAM limits while keeping local compatibility
         browser = p.chromium.launch(
             headless=True,
             args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
+                "--no-sandbox", 
+                "--disable-setuid-sandbox", 
                 "--disable-dev-shm-usage",
                 "--disable-gpu"
             ]
         )
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            ignore_https_errors=True
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         )
         page = context.new_page()
 
-        # Block non-essential resources to save bandwidth and memory
+        # Cloud Optimization: Block unnecessary heavy resources but KEEP images for the UI
         def handle_route(route):
-            if route.request.resource_type in ["font", "media", "manifest"]:
-                route.abort()
-            elif any(x in route.request.url for x in ["analytics", "doubleclick", "facebook", "google-analytics"]):
+            if route.request.resource_type in ["font", "media"]:
                 route.abort()
             else:
                 route.fallback()
 
         page.route("**/*", handle_route)
         
-        # Navigate and wait for content
-        page.goto(url, timeout=30000, wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
-
-        # 1. Scrape Price
-        price_selectors = [".pipcom-price__integer", ".pip-price__integer", ".pip-temp-price-weighted__integer"]
-        price = None
-        for selector in price_selectors:
-            el = page.query_selector(selector)
+        # Increase timeout for slow cloud environments
+        page.goto(url, timeout=60000, wait_until="domcontentloaded")
+        
+        # Scrape Price
+        price_selectors = [".pip-price__integer", ".pipcom-price__integer", ".pip-temp-price-weighted__integer"]
+        price_text = None
+        for sel in price_selectors:
+            el = page.query_selector(sel)
             if el:
-                price = el.inner_text().strip()
+                price_text = el.inner_text().strip()
                 break
         
-        # 2. Scrape Product Name
+        # Scrape Product Name
         name_el = page.query_selector("h1, .pip-header-section__title--big")
-        name = name_el.inner_text().strip() if name_el else "IKEA Product"
+        name = name_el.inner_text().strip() if name_el else "IKEA Item"
 
-        # 3. Scrape Product Image (Handles srcset for high-res)
+        # Scrape Product Image (Restored and fixed)
         image_url = None
-        img_selectors = ["img.pipf-image", "img.pip-image", ".pip-aspect-ratio-box__target"]
-        for sel in img_selectors:
-            img_el = page.query_selector(sel)
-            if img_el:
-                srcset = img_el.get_attribute("srcset")
-                if srcset:
-                    image_url = srcset.split(',')[0].split(' ')[0].strip()
-                if not image_url or "false" in str(image_url):
-                    image_url = img_el.get_attribute("src")
-                if image_url:
-                    if image_url.startswith('//'): image_url = "https:" + image_url
-                    break
+        img_el = page.query_selector("img.pip-image")
+        if img_el:
+            # Check for high-res srcset first, fallback to src
+            srcset = img_el.get_attribute("srcset")
+            if srcset:
+                image_url = srcset.split(',')[0].split(' ')[0].strip()
+            else:
+                image_url = img_el.get_attribute("src")
         
+        if image_url and image_url.startswith('//'):
+            image_url = "https:" + image_url
+
         parsed_price = None
-        if price:
+        if price_text:
             try:
-                parsed_price = float(price.replace(',', '.'))
+                # Handle different European decimal separators
+                parsed_price = float(price_text.replace(',', '.').replace(' ', ''))
             except ValueError:
                 parsed_price = None
 
         return country_code, {
             "price": parsed_price, 
-            "display_price": f"€{price}" if price else "N/A",
+            "display_price": f"€{price_text}" if price_text else "N/A",
             "name": name,
             "image": image_url,
             "url": url,
-            "status": "success" if price else "error"
+            "status": "success" if price_text else "error"
         }
 
     except Exception as e:
@@ -113,41 +105,28 @@ def index():
 
 @app.route('/compare', methods=['POST'])
 def compare():
-    item_id = request.json.get('item_id')
+    data = request.get_json()
+    item_id = data.get('item_id')
     results = {}
     tasks = [(code, item_id) for code in URL_TEMPLATES.keys()]
     
-    # max_workers=2 is safer for 512MB RAM environments
+    # max_workers=2 is the sweet spot for 512MB RAM on Render
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future_to_code = {executor.submit(get_price_via_browser, task): task[0] for task in tasks}
-        try:
-            # Increased timeout for sequential processing
-            for future in concurrent.futures.as_completed(future_to_code, timeout=60):
-                code, data = future.result()
-                results[code] = data
-        except concurrent.futures.TimeoutError:
-            pass
+        for future in concurrent.futures.as_completed(future_to_code, timeout=120):
+            code, res = future.result()
+            results[code] = res
 
-    # Language Sync: Use an English name from NL/BE/DE for the UI header and FR result
-    english_name = None
-    for code in ['NL', 'BE', 'DE']:
-        if code in results and results[code]['status'] == 'success':
-            english_name = results[code]['name']
-            break
-    
-    if english_name:
-        for code in results:
-            if results[code]['status'] == 'success':
-                results[code]['name'] = english_name
+    # Sync French Product names to English for consistency
+    eng_name = next((results[c]['name'] for c in ['NL','BE','DE'] if results.get(c,{}).get('status')=='success'), None)
+    if eng_name:
+        for c in results:
+            if results[c]['status'] == 'success':
+                results[c]['name'] = eng_name
 
-    # Ensure all keys exist
-    for code in URL_TEMPLATES.keys():
-        if code not in results:
-            results[code] = {"price": None, "display_price": "N/A", "name": "-", "status": "error", "url": URL_TEMPLATES[code].format(id=item_id)}
-            
     return jsonify(results)
 
 if __name__ == '__main__':
-    # Use environment port for deployment
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    # debug=True enabled for local troubleshooting
+    app.run(host='0.0.0.0', port=port, debug=True)

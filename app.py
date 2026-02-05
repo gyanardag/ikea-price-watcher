@@ -1,6 +1,5 @@
 from flask import Flask, render_template, request, jsonify
 from playwright.sync_api import sync_playwright
-import concurrent.futures
 import os
 
 app = Flask(__name__)
@@ -13,39 +12,13 @@ URL_TEMPLATES = {
     'DE': 'https://www.ikea.com/de/en/p/{id}/'
 }
 
-def get_price_via_browser(country_data):
-    country_code, item_id = country_data
+def scrape_product(page, country_code, item_id):
+    """Scrapes a single product using an existing page instance."""
     clean_id = item_id.replace('.', '').replace(' ', '')
     url = URL_TEMPLATES[country_code].format(id=clean_id)
     
-    p = sync_playwright().start()
-    browser = None
     try:
-        # Optimized for Cloud (Render) RAM limits while keeping local compatibility
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox", 
-                "--disable-setuid-sandbox", 
-                "--disable-dev-shm-usage",
-                "--disable-gpu"
-            ]
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        )
-        page = context.new_page()
-
-        # Cloud Optimization: Block unnecessary heavy resources but KEEP images for the UI
-        def handle_route(route):
-            if route.request.resource_type in ["font", "media"]:
-                route.abort()
-            else:
-                route.fallback()
-
-        page.route("**/*", handle_route)
-        
-        # Increase timeout for slow cloud environments
+        # Navigate with a generous timeout
         page.goto(url, timeout=60000, wait_until="domcontentloaded")
         
         # Scrape Price
@@ -57,20 +30,16 @@ def get_price_via_browser(country_data):
                 price_text = el.inner_text().strip()
                 break
         
-        # Scrape Product Name
+        # Scrape Name
         name_el = page.query_selector("h1, .pip-header-section__title--big")
         name = name_el.inner_text().strip() if name_el else "IKEA Item"
 
-        # Scrape Product Image (Restored and fixed)
+        # Scrape Image
         image_url = None
         img_el = page.query_selector("img.pip-image")
         if img_el:
-            # Check for high-res srcset first, fallback to src
             srcset = img_el.get_attribute("srcset")
-            if srcset:
-                image_url = srcset.split(',')[0].split(' ')[0].strip()
-            else:
-                image_url = img_el.get_attribute("src")
+            image_url = srcset.split(',')[0].split(' ')[0].strip() if srcset else img_el.get_attribute("src")
         
         if image_url and image_url.startswith('//'):
             image_url = "https:" + image_url
@@ -78,12 +47,11 @@ def get_price_via_browser(country_data):
         parsed_price = None
         if price_text:
             try:
-                # Handle different European decimal separators
                 parsed_price = float(price_text.replace(',', '.').replace(' ', ''))
-            except ValueError:
+            except:
                 parsed_price = None
 
-        return country_code, {
+        return {
             "price": parsed_price, 
             "display_price": f"€{price_text}" if price_text else "N/A",
             "name": name,
@@ -91,13 +59,9 @@ def get_price_via_browser(country_data):
             "url": url,
             "status": "success" if price_text else "error"
         }
-
     except Exception as e:
-        print(f"Error [{country_code}]: {str(e)}")
-        return country_code, {"price": None, "display_price": "Error", "name": "-", "status": "error", "url": url}
-    finally:
-        if browser: browser.close()
-        p.stop()
+        print(f"Scrape Error [{country_code}]: {e}")
+        return {"price": None, "display_price": "Error", "name": "-", "status": "error", "url": url}
 
 @app.route('/')
 def index():
@@ -108,17 +72,29 @@ def compare():
     data = request.get_json()
     item_id = data.get('item_id')
     results = {}
-    tasks = [(code, item_id) for code in URL_TEMPLATES.keys()]
-    
-    # max_workers=2 is the sweet spot for 512MB RAM on Render
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        future_to_code = {executor.submit(get_price_via_browser, task): task[0] for task in tasks}
-        for future in concurrent.futures.as_completed(future_to_code, timeout=120):
-            code, res = future.result()
-            results[code] = res
 
-    # Sync French Product names to English for consistency
-    eng_name = next((results[c]['name'] for c in ['NL','BE','DE'] if results.get(c,{}).get('status')=='success'), None)
+    with sync_playwright() as p:
+        # Launch ONE browser instance to save RAM
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+        page = context.new_page()
+
+        # Optimization: Block heavy ads/trackers but keep images
+        page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["font", "media"] else route.fallback())
+
+        # Process countries one by one (Sequential is necessary for 512MB RAM)
+        for code in URL_TEMPLATES.keys():
+            results[code] = scrape_product(page, code, item_id)
+
+        browser.close()
+
+    # Consolidate product names to English where possible
+    eng_name = next((results[c]['name'] for c in ['NL','BE','DE'] if results[c]['status'] == 'success'), None)
     if eng_name:
         for c in results:
             if results[c]['status'] == 'success':
@@ -128,5 +104,4 @@ def compare():
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    # debug=True enabled for local troubleshooting
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port)
